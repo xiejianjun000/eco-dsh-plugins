@@ -13,6 +13,13 @@
  * The gate hooks `tools/pre-execute`, decides allow/ask/deny, and forwards
  * denied attempts to ctx.ecoAudit when the eco-audit-chain plugin is loaded.
  *
+ * P1 additions:
+ *   - Hot-reloadable policy: `eco_policy_reload` tool + ctx.ecoPolicy service
+ *     re-read PERMISSION.md / riskOverrides at runtime (no plugin restart).
+ *   - Three-plugin linkage: when recordDeniedToMemory=true and the
+ *     eco-memory-tree plugin is loaded, denied attempts are also written into
+ *     the memory tree as tagged security events.
+ *
  * Tool risk resolution: PERMISSION.md / config overrides > prefix map > L3 default.
  * mcp__{server}__{tool} remote tools always resolve to L3 (server is untrusted;
  * a write operation can masquerade as a query_* name) unless explicitly
@@ -24,16 +31,21 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
+import { defineTool } from '@deepseek-ai/dsh-tools'
 import Schema from '@deepseek-ai/schemastery'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
     ecoAudit?: { recordDenied(tool: string, level: string, reason: string): void }
+    ecoMemory?: {
+      add(content: string, score?: number, tags?: string[], parentId?: string | null): { id: string }
+    }
+    ecoPolicy?: { reload(): { ok: boolean; overrides: Record<string, string>; loaded_from?: string } }
   }
 }
 
 export const name = 'eco-permission-gate'
-// ecoAudit 为可选依赖：审计链插件加载后才可写拒绝事件；未加载时静默跳过
+// ecoAudit / ecoMemory 为可选联动依赖：对应插件加载后才写入；未加载时静默跳过
 export const inject = ['tools', 'ecoAudit']
 
 export const LEVEL_LABELS = { L1: 'READ', L2: 'WRITE_LOCAL', L3: 'EXEC', L4: 'EXTERNAL' } as const
@@ -81,14 +93,51 @@ export const Config = Schema.object({
     .description('Additional L3 command-prefix whitelist entries'),
   policyFile: Schema.string().default('')
     .description('Optional PERMISSION.md path; its tool_risk_overrides block is loaded'),
+  recordDeniedToMemory: Schema.boolean().default(false)
+    .description('P1 linkage: write denied attempts into the memory tree (needs eco-memory-tree)'),
 }).description('eco-permission-gate configuration')
 
+interface PolicyState {
+  overrides: Record<string, string>
+  baseOverrides: Record<string, string> // config-provided overrides (re-applied on reload)
+  mode: 'auto' | 'ask' | 'deny'
+  l4Mode: 'ask' | 'deny'
+  nonInteractive: boolean
+  whitelist: string[]
+  policyFile: string
+  recordDeniedToMemory: boolean
+  loadedFrom: string
+}
+
 export function apply(ctx: Context, config: ConfigType) {
-  const overrides = resolveOverrides(config)
+  const state: PolicyState = {
+    overrides: {},
+    baseOverrides: { ...config.riskOverrides },
+    mode: config.mode,
+    l4Mode: config.l4Mode,
+    nonInteractive: config.nonInteractive,
+    whitelist: [...config.l3Whitelist],
+    policyFile: config.policyFile,
+    recordDeniedToMemory: config.recordDeniedToMemory,
+    loadedFrom: '',
+  }
+  state.overrides = resolveOverrides(state)
+
+  /** Reload policy at runtime: re-parse PERMISSION.md + re-merge config overrides. */
+  function reload(): { ok: boolean; overrides: Record<string, string>; loaded_from?: string } {
+    state.overrides = resolveOverrides(state)
+    state.mode = config.mode
+    state.l4Mode = config.l4Mode
+    state.nonInteractive = config.nonInteractive
+    state.whitelist = [...config.l3Whitelist]
+    return { ok: true, overrides: { ...state.overrides }, loaded_from: state.loadedFrom || undefined }
+  }
+
+  ctx.provide('ecoPolicy', { reload })
 
   ctx.on('tools/pre-execute', async (exec: ToolExecution, next): Promise<PreToolDecision> => {
     const toolName = exec.name ?? 'unknown'
-    const level = toolRiskLevel(toolName, overrides)
+    const level = toolRiskLevel(toolName, state.overrides)
 
     if (level === 'L1' || level === 'L2') {
       return next() // auto allow
@@ -96,24 +145,37 @@ export function apply(ctx: Context, config: ConfigType) {
 
     if (level === 'L3') {
       const cmd = extractCommand(exec)
-      if (cmd && isWhitelisted(cmd, config)) {
+      if (cmd && isWhitelisted(cmd, state)) {
         return next() // whitelist auto allow
       }
-      if (config.mode === 'auto') return next()
-      if (config.mode === 'ask' && !config.nonInteractive) {
+      if (state.mode === 'auto') return next()
+      if (state.mode === 'ask' && !state.nonInteractive) {
         return { kind: 'ask', reason: `[eco-permission-gate L3/EXEC] ${toolName}${cmd ? `: ${cmd.slice(0, 80)}` : ''}` }
       }
-      deny(ctx, toolName, level, `non-whitelisted L3 denied (mode=${config.mode})`)
-      return { kind: 'deny', reason: `[eco-permission-gate L3/EXEC] ${toolName} denied by policy (mode=${config.mode}). Command: ${cmd.slice(0, 120) || '(none)'}` }
+      deny(ctx, toolName, level, `non-whitelisted L3 denied (mode=${state.mode})`, state)
+      return { kind: 'deny', reason: `[eco-permission-gate L3/EXEC] ${toolName} denied by policy (mode=${state.mode}). Command: ${cmd.slice(0, 120) || '(none)'}` }
     }
 
     // L4 — external writes
-    if (config.l4Mode === 'ask' && !config.nonInteractive) {
+    if (state.l4Mode === 'ask' && !state.nonInteractive) {
       return { kind: 'ask', reason: `[eco-permission-gate L4/EXTERNAL] ${toolName} calls external service / performs a write. Requires approval.` }
     }
-    deny(ctx, toolName, level, `L4 denied (mode=${config.l4Mode})`)
-    return { kind: 'deny', reason: `[eco-permission-gate L4/EXTERNAL] ${toolName} denied by policy (mode=${config.l4Mode}).` }
+    deny(ctx, toolName, level, `L4 denied (mode=${state.l4Mode})`, state)
+    return { kind: 'deny', reason: `[eco-permission-gate L4/EXTERNAL] ${toolName} denied by policy (mode=${state.l4Mode}).` }
   })
+
+  ctx.tools.register(defineTool({
+    name: 'eco_policy_reload',
+    description: 'Hot-reload the permission policy (PERMISSION.md + config overrides) without restarting the plugin. Returns the effective tool risk overrides.',
+    parameters: {},
+    output: {
+      schema: { type: 'json' },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    async execute() {
+      return JSON.parse(JSON.stringify(reload()))
+    },
+  }))
 }
 
 /** Resolve risk level: overrides > prefix map > L3 default. */
@@ -133,8 +195,8 @@ function extractCommand(exec: ToolExecution): string {
   return String(args.command ?? args.code ?? args.script ?? '')
 }
 
-function isWhitelisted(cmd: string, config: ConfigType): boolean {
-  const wl = [...DEFAULT_L3_WHITELIST, ...config.l3Whitelist]
+function isWhitelisted(cmd: string, state: PolicyState): boolean {
+  const wl = [...DEFAULT_L3_WHITELIST, ...state.whitelist]
   return wl.some((w) => {
     const prefix = w.trim()
     return prefix && cmd.startsWith(prefix)
@@ -142,9 +204,9 @@ function isWhitelisted(cmd: string, config: ConfigType): boolean {
 }
 
 /** Load PERMISSION.md tool_risk_overrides block (no YAML dependency), then merge config. */
-function resolveOverrides(config: ConfigType): Record<string, string> {
-  const merged: Record<string, string> = { ...config.riskOverrides }
-  const text = readPermissionMd(config.policyFile)
+function resolveOverrides(state: PolicyState): Record<string, string> {
+  const merged: Record<string, string> = { ...state.baseOverrides }
+  const text = readPermissionMd(state.policyFile)
   if (!text) return merged
   // tool_risk_overrides:\n  - tool: xxx\n    level: Lx
   const re = /-\s*tool:\s*([A-Za-z0-9_]+)\s*\n\s*level:\s*(L[1-4])/g
@@ -152,6 +214,7 @@ function resolveOverrides(config: ConfigType): Record<string, string> {
   while ((m = re.exec(text)) !== null) {
     merged[m[1]] = m[2].toUpperCase()
   }
+  state.loadedFrom = state.policyFile || ''
   return merged
 }
 
@@ -169,12 +232,26 @@ function readPermissionMd(policyFile: string): string {
   return ''
 }
 
-/** Forward a denied decision to the audit chain when eco-audit-chain is present. */
-function deny(ctx: Context, tool: string, level: string, reason: string): void {
+/** Forward a denied decision to the audit chain and (optionally) the memory tree.
+ *  Uses ctx.get() so both targets stay optional (no inject requirement):
+ *  a service that is absent or not provided returns undefined instead of throwing. */
+function deny(ctx: Context, tool: string, level: string, reason: string, state: PolicyState): void {
   try {
-    ctx.ecoAudit?.recordDenied(tool, level, reason)
+    ctx.get('ecoAudit')?.recordDenied(tool, level, reason)
   } catch {
     // audit must never break the gate
+  }
+  if (state.recordDeniedToMemory) {
+    try {
+      ctx.get('ecoMemory')?.add(
+        `[SECURITY] denied ${tool} (${level}): ${reason.slice(0, 200)}`,
+        3,
+        ['security', 'denied', tool],
+        null,
+      )
+    } catch {
+      // memory must never break the gate either
+    }
   }
 }
 
@@ -185,4 +262,5 @@ type ConfigType = {
   riskOverrides: Record<string, string>
   l3Whitelist: string[]
   policyFile: string
+  recordDeniedToMemory: boolean
 }

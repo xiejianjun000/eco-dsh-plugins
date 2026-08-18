@@ -173,17 +173,70 @@ export class EcoAuditService {
     }
   }
 
-  /** Query the most recent records (newest first). */
-  query(limit = 20, operation?: string): AuditRecord[] {
+  /** Query records (newest first) with rich filters (P1: decision/level/time/who/keyword + pagination). */
+  query(opts: {
+    limit?: number
+    offset?: number
+    operation?: string
+    decision?: string
+    level?: string
+    from?: number
+    to?: number
+    who?: string
+    keyword?: string
+  } = {}): AuditRecord[] {
     const lines = this.rawLines()
-    const out: AuditRecord[] = []
-    for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+    const limit = Math.max(1, Math.min(opts.limit ?? 20, 500))
+    const offset = Math.max(0, opts.offset ?? 0)
+    const matches: AuditRecord[] = []
+    for (let i = lines.length - 1; i >= 0; i--) {
       try {
         const e = JSON.parse(lines[i]) as AuditRecord
-        if (!operation || e.operation === operation) out.push(e)
-      } catch { /* skip */ }
+        if (opts.operation && e.operation !== opts.operation) continue
+        if (opts.decision && String(e.decision ?? '') !== opts.decision) continue
+        if (opts.level && String(e.level ?? '') !== opts.level) continue
+        if (opts.who && String(e.who ?? '') !== opts.who) continue
+        if (opts.from !== undefined && (e.timestamp ?? 0) < opts.from) continue
+        if (opts.to !== undefined && (e.timestamp ?? 0) > opts.to) continue
+        if (opts.keyword) {
+          const hay = `${e.what ?? ''} ${e.result ?? ''} ${e.reason ?? ''} ${e.input_data ?? ''}`.toLowerCase()
+          if (!hay.includes(opts.keyword.toLowerCase())) continue
+        }
+        matches.push(e)
+      } catch { /* skip corrupt line */ }
     }
-    return out
+    return matches.slice(offset, offset + limit)
+  }
+
+  /** Aggregate distribution (P1): by decision / level / operation / hour. */
+  summary(): Record<string, unknown> {
+    const byDecision: Record<string, number> = {}
+    const byLevel: Record<string, number> = {}
+    const byOperation: Record<string, number> = {}
+    const byHour: Record<string, number> = {}
+    let deniedTotal = 0
+    for (const line of this.rawLines()) {
+      try {
+        const e = JSON.parse(line) as AuditRecord
+        const decision = String(e.decision ?? 'allow')
+        byDecision[decision] = (byDecision[decision] ?? 0) + 1
+        const level = String(e.level ?? 'L1')
+        byLevel[level] = (byLevel[level] ?? 0) + 1
+        const op = String(e.operation ?? 'unknown')
+        byOperation[op] = (byOperation[op] ?? 0) + 1
+        if (decision === 'deny') deniedTotal++
+        const h = new Date((e.timestamp ?? 0) * 1000).toISOString().slice(0, 13)
+        byHour[h] = (byHour[h] ?? 0) + 1
+      } catch { /* skip corrupt line */ }
+    }
+    return {
+      entries: this.rawLines().length,
+      by_decision: byDecision,
+      by_level: byLevel,
+      by_operation: byOperation,
+      by_hour: byHour,
+      denied_total: deniedTotal,
+    }
   }
 
   rawLines(): string[] {
@@ -262,17 +315,47 @@ export function apply(ctx: Context, config: ConfigType) {
 
   ctx.tools.register(defineTool({
     name: 'eco_audit_query',
-    description: 'Query the most recent audit records (newest first).',
+    description: 'Query audit records (newest first) with filters: operation, decision (allow/deny), level (L1-L4), time range (from/to unix seconds), who, keyword; supports offset pagination.',
     parameters: {
-      limit: { type: 'number', description: 'Max records, default 20' },
+      limit: { type: 'number', description: 'Max records, default 20, max 500' },
+      offset: { type: 'number', description: 'Skip N matching records, default 0' },
       operation: { type: 'string', description: 'Filter by operation (tool_call / llm_call / chat_trace)' },
+      decision: { type: 'string', enum: ['allow', 'deny', 'ask'], description: 'Filter by gate decision' },
+      level: { type: 'string', enum: ['L1', 'L2', 'L3', 'L4'], description: 'Filter by risk level' },
+      from: { type: 'number', description: 'Start time (unix seconds)' },
+      to: { type: 'number', description: 'End time (unix seconds)' },
+      who: { type: 'string', description: 'Filter by operator' },
+      keyword: { type: 'string', description: 'Substring match over what/result/reason/input' },
     },
     output: {
       schema: { type: 'json' },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     async execute(args) {
-      return JSON.parse(JSON.stringify(service.query(args?.limit ?? 20, args?.operation)))
+      return JSON.parse(JSON.stringify(service.query({
+        limit: args?.limit,
+        offset: args?.offset,
+        operation: args?.operation,
+        decision: args?.decision,
+        level: args?.level,
+        from: args?.from,
+        to: args?.to,
+        who: args?.who,
+        keyword: args?.keyword,
+      })))
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'eco_audit_summary',
+    description: 'Audit chain aggregate summary: distributions by decision / level / operation / hour, plus denied total.',
+    parameters: {},
+    output: {
+      schema: { type: 'json' },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    async execute() {
+      return JSON.parse(JSON.stringify(service.summary()))
     },
   }))
 }

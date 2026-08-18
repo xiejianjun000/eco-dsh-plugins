@@ -10,6 +10,12 @@ dsh plugin — 评分制记忆树：BM25 搜索 + 中文降级 + Obsidian 双向
 - **BM25 排序检索**：英文按 token 计算 BM25；含 CJK 字符时降级为子串命中 + 覆盖率加分（对齐原版 FTS5 + LIKE 中文降级思路）。
 - **Obsidian 双向同步**：导出为带 frontmatter 的 Markdown 笔记（`id/score/tags/updated_at`），也从 vault 导入用户编辑后的笔记，按 `updated_at` 保留最新。
 
+## v0.2.0 — 向量检索通道
+
+- 新增 `eco_memory_vector_search`：配置 OpenAI 兼容 embedding 端点后启用向量检索（BM25 + 余弦分数融合排序）。
+- 未配置 embedding 时自动降级返回 BM25 结果并标记 `vector_enabled=false`，不阻塞使用。
+- 配置方式：`embeddingBaseUrl` / `embeddingApiKey` / `embeddingModel`，或运行时 `ctx.ecoMemory.setEmbeddingFn(fn)`。
+
 ## 安装
 
 ```bash

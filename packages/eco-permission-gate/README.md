@@ -17,6 +17,12 @@ dsh plugin — L1-L4 风险权限闸门。
 
 等级解析顺序：`PERMISSION.md / 配置覆盖` > `前缀映射` > `默认 L3`。`mcp__{server}__{tool}` 远程工具一律保守解析为 L3。
 
+## v0.2.0 — 策略热更新 + 三插件联动
+
+- 新增 `eco_policy_reload` 工具：运行时重新解析 `PERMISSION.md` 与配置 overrides，无需重启插件；同时提供 `ctx.ecoPolicy.reload()` 服务。
+- 新增 `recordDeniedToMemory` 配置：开启后每次拒绝事件自动写入记忆树（`[SECURITY]` 前缀 + `security/denied/tool` 标签），配合 eco-memory-tree 形成安全事件记忆。
+- 联动采用 `ctx.get()` 读取可选服务，未加载审计链 / 记忆树时静默降级，不影响权限闸门独立使用。
+
 ## 安装
 
 ```bash

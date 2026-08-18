@@ -14,6 +14,11 @@ current_hash = SM3(prev_hash + timestamp + operation + input_hash + output_hash)
 
 任何对历史记录的篡改都会导致链断裂，`verify()` 重算每一行并报告首个不匹配位置。内置纯 TS 零依赖 SM3 实现（`sm3.ts`），无需原生模块。
 
+## v0.2.0 — 查询增强
+
+- `eco_audit_query` 支持多维过滤：`decision`(allow/deny/ask)、`level`(L1-L4)、`operation`、`who`、`keyword`(正文子串)、`from/to`(时间范围)、`offset` 分页。
+- 新增 `eco_audit_summary`：按决策 / 风险级别 / 操作类型 / 小时维度聚合统计，返回 `denied_total` 等安全态势指标。
+
 ## 安装
 
 ```bash
