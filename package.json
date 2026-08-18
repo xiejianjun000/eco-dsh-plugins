@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "description": "dsh plugins ported from eco-agent: permission gate, audit chain, memory tree",
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" }
+  },
   "type": "module",
   "workspaces": [
     "packages/*"
