@@ -1,0 +1,50 @@
+# eco-memory-tree
+
+dsh plugin — 评分制记忆树：BM25 搜索 + 中文降级 + Obsidian 双向同步。
+
+> 移植自 [xiejianjun000/eco-agent](https://github.com/xiejianjun000/eco-agent) 的 `agent_core/memory_tree.py`（MIT License）。
+
+## 作用
+
+- **评分制节点**：每条记忆带 `score`（重要性）、`tags`、`parent_id`（树形结构）。
+- **BM25 排序检索**：英文按 token 计算 BM25；含 CJK 字符时降级为子串命中 + 覆盖率加分（对齐原版 FTS5 + LIKE 中文降级思路）。
+- **Obsidian 双向同步**：导出为带 frontmatter 的 Markdown 笔记（`id/score/tags/updated_at`），也从 vault 导入用户编辑后的笔记，按 `updated_at` 保留最新。
+
+## 安装
+
+```bash
+npm install @eco-dsh/eco-memory-tree
+```
+
+```ts
+import * as ecoMemoryTree from '@eco-dsh/eco-memory-tree'
+
+app.plugin(ecoMemoryTree, {
+  storeFile: '~/.eco/dsh/memory/memory_tree.json',
+  obsidianVault: '/path/to/vault/eco-memory', // 留空则禁用同步
+  syncOnStart: false,
+})
+```
+
+## 注册工具
+
+| 工具 | 说明 |
+|------|------|
+| `eco_memory_add` | 添加节点（content / score / tags / parent_id） |
+| `eco_memory_search` | 按相关性检索（BM25 + 中文降级 + score 加成） |
+| `eco_memory_update` | 更新节点 |
+| `eco_memory_delete` | 删除节点 |
+| `eco_memory_stats` | 统计：节点数、平均分、标签分布 |
+| `eco_memory_sync` | Obsidian 同步：`to` / `from` / `both` |
+
+## 配置项
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `storeFile` | `~/.eco/dsh/memory/memory_tree.json` | 节点账本路径 |
+| `obsidianVault` | `''` | Obsidian vault 目录（空 = 禁用同步） |
+| `syncOnStart` | `false` | 启动时先导入一次 vault |
+
+## 许可
+
+MIT。原始实现版权归 [xiejianjun000/eco-agent](https://github.com/xiejianjun000/eco-agent) 所有，本包为 dsh 生态移植版。
