@@ -15,10 +15,17 @@
  *   - exposes ctx.ecoAudit (EcoAuditService) so other plugins (e.g. the
  *     permission gate) can record denied attempts through the same chain;
  *   - registers model-facing tools: eco_audit_verify / eco_audit_stats /
- *     eco_audit_query.
+ *     eco_audit_query / eco_audit_export.
+ *
+ * P2 (v0.3.0):
+ *   - maxEntries retention: when the live chain exceeds maxEntries, it is
+ *     archived as trace_audit_<ts>.jsonl (fully verifiable, chain preserved)
+ *     and a fresh chain starts from genesis — no truncation, no broken links.
+ *   - `eco_audit_export` exports records across the live chain and all
+ *     rotated archives with the same rich filters as eco_audit_query.
  */
 
-import { mkdirSync, readFileSync, appendFileSync, existsSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, appendFileSync, existsSync, statSync, renameSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
@@ -33,6 +40,8 @@ export const Config = Schema.object({
     .description('Directory for trace_audit.jsonl'),
   autoRecord: Schema.boolean().default(true)
     .description('Automatically record tool calls via tools/result'),
+  maxEntries: Schema.number().default(0).min(0)
+    .description('P2 retention: max entries in the live chain before rotating to trace_audit_<ts>.jsonl (0 = unlimited)'),
 })
 
 /** Genesis predecessor hash — identical role to govmcp AuditChain's genesis. */
@@ -65,13 +74,65 @@ export interface AuditRecord {
 export class EcoAuditService {
   readonly chainPath: string
 
-  constructor(readonly auditDir: string) {
+  constructor(readonly auditDir: string, readonly maxEntries = 0) {
     mkdirSync(auditDir, { recursive: true })
     this.chainPath = join(auditDir, 'trace_audit.jsonl')
   }
 
+  /** P2 retention: rotate the live chain to trace_audit_<ts>.jsonl when over maxEntries. */
+  private maybeRotate(): void {
+    if (this.maxEntries <= 0) return
+    const lines = this.rawLines()
+    if (lines.length < this.maxEntries) return
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const uniq = Math.random().toString(36).slice(2, 8)
+    renameSync(this.chainPath, join(this.auditDir, `trace_audit_${stamp}_${uniq}.jsonl`))
+  }
+
+  /** P2: archive files of this chain (newest first). */
+  archives(): string[] {
+    const names = readdirSync(this.auditDir).filter(n => /^trace_audit_.+\.jsonl$/.test(n))
+    names.sort().reverse()
+    return names.map(n => join(this.auditDir, n))
+  }
+
+  /** P2: export live + archived records with the same filters as query(). */
+  exportAll(opts: {
+    operation?: string
+    decision?: string
+    level?: string
+    from?: number
+    to?: number
+    who?: string
+    keyword?: string
+  } = {}): AuditRecord[] {
+    const out: AuditRecord[] = []
+    const files = [...this.archives(), this.chainPath]
+    for (const f of files) {
+      if (!existsSync(f)) continue
+      for (const line of readFileSync(f, 'utf8').split(/\r?\n/).filter(Boolean)) {
+        try {
+          const e = JSON.parse(line) as AuditRecord
+          if (opts.operation && e.operation !== opts.operation) continue
+          if (opts.decision && String(e.decision ?? '') !== opts.decision) continue
+          if (opts.level && String(e.level ?? '') !== opts.level) continue
+          if (opts.who && String(e.who ?? '') !== opts.who) continue
+          if (opts.from !== undefined && (e.timestamp ?? 0) < opts.from) continue
+          if (opts.to !== undefined && (e.timestamp ?? 0) > opts.to) continue
+          if (opts.keyword) {
+            const hay = `${e.what ?? ''} ${e.result ?? ''} ${e.reason ?? ''} ${e.input_data ?? ''}`.toLowerCase()
+            if (!hay.includes(opts.keyword.toLowerCase())) continue
+          }
+          out.push(e)
+        } catch { /* skip corrupt line */ }
+      }
+    }
+    return out
+  }
+
   /** Append a five-element entry to the SM3 hash chain (JSONL, fsynced). */
   append(entry: Record<string, unknown>, operation: string, operator = 'eco-agent'): AuditRecord {
+    this.maybeRotate()
     const prev = this.lastHash()
     const timestamp = Date.now() / 1000
     const inputData = JSON.stringify(entry)
@@ -266,7 +327,7 @@ declare module '@deepseek-ai/cordis' {
 }
 
 export function apply(ctx: Context, config: ConfigType) {
-  const service = new EcoAuditService(config.auditDir)
+  const service = new EcoAuditService(config.auditDir, config.maxEntries)
   ctx.provide('ecoAudit', service)
 
   if (config.autoRecord) {
@@ -358,6 +419,35 @@ export function apply(ctx: Context, config: ConfigType) {
       return JSON.parse(JSON.stringify(service.summary()))
     },
   }))
+
+  ctx.tools.register(defineTool({
+    name: 'eco_audit_export',
+    description: 'Export audit records across the live chain and all rotated archives (P2 retention) with filters: operation, decision, level, time range (from/to unix seconds), who, keyword. Returns JSON array.',
+    parameters: {
+      operation: { type: 'string', description: 'Filter by operation (tool_call / llm_call / chat_trace)' },
+      decision: { type: 'string', enum: ['allow', 'deny', 'ask'], description: 'Filter by gate decision' },
+      level: { type: 'string', enum: ['L1', 'L2', 'L3', 'L4'], description: 'Filter by risk level' },
+      from: { type: 'number', description: 'Start time (unix seconds)' },
+      to: { type: 'number', description: 'End time (unix seconds)' },
+      who: { type: 'string', description: 'Filter by operator' },
+      keyword: { type: 'string', description: 'Substring match over what/result/reason/input' },
+    },
+    output: {
+      schema: { type: 'json' },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    async execute(args) {
+      return JSON.parse(JSON.stringify(service.exportAll({
+        operation: args?.operation,
+        decision: args?.decision,
+        level: args?.level,
+        from: args?.from,
+        to: args?.to,
+        who: args?.who,
+        keyword: args?.keyword,
+      })))
+    },
+  }))
 }
 
-type ConfigType = { auditDir: string; autoRecord: boolean }
+type ConfigType = { auditDir: string; autoRecord: boolean; maxEntries: number }

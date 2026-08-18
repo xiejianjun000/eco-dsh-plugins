@@ -24,7 +24,15 @@
  *
  * Tools: eco_memory_add / eco_memory_search / eco_memory_vector_search /
  *        eco_memory_update / eco_memory_delete / eco_memory_stats /
- *        eco_memory_sync
+ *        eco_memory_sync / eco_memory_prune
+ *
+ * P2 (v0.3.0) — forgetting & maintenance:
+ *   - Nodes track last_access (touched on every add/update/search hit).
+ *   - `eco_memory_prune` implements aging: drop low-score nodes and nodes
+ *     untouched for maxAgeDays. Security-tagged nodes (tags include
+ *     'security' or 'denied') are ALWAYS protected so the permission-gate
+ *     linkage never loses evidence. Children of removed nodes are promoted
+ *     to roots. dryRun=true previews the outcome without deleting.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs'
@@ -62,8 +70,12 @@ export interface MemoryNode {
   created_at: number
   updated_at: number
   source: string // 'manual' | 'obsidian' | 'import'
+  last_access?: number // P2: last read/write touch, used by prune aging
   embedding?: number[] // optional vector channel (P1)
 }
+
+/** Security-related tags are protected from pruning (permission-gate linkage). */
+const PROTECTED_TAGS = new Set(['security', 'denied'])
 
 const CJK_RE = /[\u4e00-\u9fff]/
 
@@ -221,6 +233,7 @@ export class MemoryTreeService {
       created_at: now,
       updated_at: now,
       source: 'manual',
+      last_access: now,
     }
     this.nodes.push(node)
     this.save()
@@ -241,6 +254,7 @@ export class MemoryTreeService {
     if (patch.tags !== undefined) node.tags = patch.tags
     if (patch.parent_id !== undefined) node.parent_id = patch.parent_id
     node.updated_at = Date.now()
+    node.last_access = Date.now()
     this.save()
     if (this.vectorEnabled) this.ensureEmbeddings().catch(() => { /* ignore */ })
     return node
@@ -264,7 +278,7 @@ export class MemoryTreeService {
     const vecs = await this.embedTexts([query])
     if (!vecs || vecs.length === 0) return []
     const qv = vecs[0]
-    return this.nodes
+    const hits = this.nodes
       .filter((n) => n.embedding && n.embedding.length === qv.length)
       .map((node) => {
         const sim = cosineSim(node.embedding!, qv)
@@ -273,6 +287,8 @@ export class MemoryTreeService {
       .filter((x) => x.vector > 0)
       .sort((a, b) => b.relevance - a.relevance)
       .slice(0, limit)
+    this.touch(hits.map((x) => x.node.id))
+    return hits
   }
 
   /** Hybrid search: BM25 + optional vector blend (weighted). */
@@ -283,7 +299,9 @@ export class MemoryTreeService {
 
     const w = this.vectorWeight
     if (!this.vectorEnabled || w <= 0 || bm25.length === 0) {
-      return bm25.sort((a, b) => b.relevance - a.relevance).slice(0, limit)
+      const out = bm25.sort((a, b) => b.relevance - a.relevance).slice(0, limit)
+      this.touch(out.map((x) => x.node.id))
+      return out
     }
 
     // Fuse: normalize both scores to [0,1] then blend; vector is queried on demand.
@@ -294,7 +312,9 @@ export class MemoryTreeService {
       vec = []
     }
     if (vec.length === 0) {
-      return bm25.sort((a, b) => b.relevance - a.relevance).slice(0, limit)
+      const out = bm25.sort((a, b) => b.relevance - a.relevance).slice(0, limit)
+      this.touch(out.map((x) => x.node.id))
+      return out
     }
 
     const maxB = Math.max(...bm25.map((x) => x.relevance), 1e-9)
@@ -313,7 +333,77 @@ export class MemoryTreeService {
       })
       .sort((a, b) => b.relevance - a.relevance)
       .slice(0, limit)
+    this.touch(fused.map((x) => x.node.id))
     return fused
+  }
+
+  /** Mark nodes as accessed (P2 aging input); persists lazily via save(). */
+  private touch(ids: string[]): void {
+    if (ids.length === 0) return
+    const now = Date.now()
+    let changed = false
+    for (const id of ids) {
+      const node = this.nodes.find((n) => n.id === id)
+      if (node && node.last_access !== now) {
+        node.last_access = now
+        changed = true
+      }
+    }
+    if (changed) this.save()
+  }
+
+  /**
+   * P2 forgetting & maintenance: drop low-score and long-unused nodes.
+   * Security-tagged nodes are always protected. Children of removed nodes
+   * are promoted to roots. dryRun previews without deleting.
+   */
+  prune(opts: { minScore?: number; maxAgeDays?: number; dryRun?: boolean } = {}): Record<string, unknown> {
+    const now = Date.now()
+    const minScore = opts.minScore ?? 0
+    const maxAgeMs = opts.maxAgeDays && opts.maxAgeDays > 0 ? opts.maxAgeDays * 24 * 3600 * 1000 : 0
+    const dryRun = !!opts.dryRun
+    const protectedIds = new Set<string>()
+    const candidates: MemoryNode[] = []
+
+    for (const node of this.nodes) {
+      if (node.tags.some((t) => PROTECTED_TAGS.has(t))) {
+        protectedIds.add(node.id)
+        continue
+      }
+      const lastTouch = node.last_access ?? node.updated_at ?? node.created_at
+      const scoreLow = node.score < minScore
+      const ageOld = maxAgeMs > 0 && (now - lastTouch) > maxAgeMs
+      if (scoreLow || ageOld) candidates.push(node)
+    }
+
+    const removed: MemoryNode[] = []
+    const promoted: string[] = []
+    if (!dryRun) {
+      const removeIds = new Set(candidates.map((n) => n.id))
+      this.nodes = this.nodes.filter((n) => !removeIds.has(n.id))
+      // promote children of removed nodes to roots
+      for (const node of this.nodes) {
+        if (node.parent_id && removeIds.has(node.parent_id)) {
+          node.parent_id = null
+          promoted.push(node.id)
+        }
+      }
+      removed.push(...candidates)
+      this.save()
+    }
+
+    return {
+      ok: true,
+      dry_run: dryRun,
+      candidates: candidates.length,
+      removed: removed.length,
+      promoted: promoted.length,
+      protected: protectedIds.size,
+      min_score: minScore,
+      max_age_days: opts.maxAgeDays ?? 0,
+      remaining_nodes: dryRun ? this.nodes.length - candidates.length : this.nodes.length,
+      sample: candidates.slice(0, 5).map((n) => ({ id: n.id, score: n.score, content: n.content.slice(0, 60) })),
+    }
   }
 
   stats(): Record<string, unknown> {
@@ -575,6 +665,27 @@ export function apply(ctx: Context, config: ConfigType) {
     },
     async execute(args) {
       return JSON.parse(JSON.stringify(service.sync((args?.direction ?? 'both') as 'to' | 'from' | 'both')))
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'eco_memory_prune',
+    description: 'Forgetting & maintenance: drop low-score nodes and nodes untouched for maxAgeDays. Security-tagged nodes (security/denied) are always protected. Children of removed nodes are promoted to roots. Use dryRun=true to preview.',
+    parameters: {
+      min_score: { type: 'number', description: 'Drop nodes with score strictly below this threshold (default 0 = disabled)' },
+      max_age_days: { type: 'number', description: 'Drop nodes not accessed within this many days (default 0 = disabled)' },
+      dry_run: { type: 'boolean', description: 'Preview only; no deletion. Default false' },
+    },
+    output: {
+      schema: { type: 'json' },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    async execute(args) {
+      return JSON.parse(JSON.stringify(service.prune({
+        minScore: args?.min_score,
+        maxAgeDays: args?.max_age_days,
+        dryRun: args?.dry_run,
+      })))
     },
   }))
 }

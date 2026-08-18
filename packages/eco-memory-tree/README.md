@@ -16,6 +16,12 @@ dsh plugin — 评分制记忆树：BM25 搜索 + 中文降级 + Obsidian 双向
 - 未配置 embedding 时自动降级返回 BM25 结果并标记 `vector_enabled=false`，不阻塞使用。
 - 配置方式：`embeddingBaseUrl` / `embeddingApiKey` / `embeddingModel`，或运行时 `ctx.ecoMemory.setEmbeddingFn(fn)`。
 
+## v0.3.0 — 遗忘与维护（eco_memory_prune）
+
+- 新增 `eco_memory_prune` 工具：遗忘机制，按低分（`min_score`）或长期未访问（`max_age_days`，基于 `last_access`）清理节点。
+- `security` / `denied` 标签节点始终受保护，不被清理；被删节点的子节点自动提升为根节点。
+- `dry_run=true` 预览模式：返回候选数量与样本，不实际删除，方便先评估后执行。
+
 ## 安装
 
 ```bash

@@ -19,6 +19,11 @@ current_hash = SM3(prev_hash + timestamp + operation + input_hash + output_hash)
 - `eco_audit_query` 支持多维过滤：`decision`(allow/deny/ask)、`level`(L1-L4)、`operation`、`who`、`keyword`(正文子串)、`from/to`(时间范围)、`offset` 分页。
 - 新增 `eco_audit_summary`：按决策 / 风险级别 / 操作类型 / 小时维度聚合统计，返回 `denied_total` 等安全态势指标。
 
+## v0.3.0 — 归档轮转与导出
+
+- 新增 `maxEntries` 配置：live 链超过条数后自动归档为 `trace_audit_<ts>.jsonl` 并从 genesis 开启新链——不截断、不断链，历史归档仍可完整 `verify()`。
+- 新增 `eco_audit_export` 工具：跨 live 链与全部归档导出记录，支持与 `eco_audit_query` 相同的多维过滤，适合合规留存与安全取证。
+
 ## 安装
 
 ```bash

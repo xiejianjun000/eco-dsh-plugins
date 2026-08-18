@@ -1,6 +1,6 @@
 {
   "name": "@eco-dsh/eco-audit-chain",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "dsh plugin: SM3 tamper-evident execution audit chain (port of eco-agent trace_audit.py)",
   "type": "module",
   "main": "lib/index.js",

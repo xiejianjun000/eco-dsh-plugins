@@ -23,6 +23,12 @@ dsh plugin — L1-L4 风险权限闸门。
 - 新增 `recordDeniedToMemory` 配置：开启后每次拒绝事件自动写入记忆树（`[SECURITY]` 前缀 + `security/denied/tool` 标签），配合 eco-memory-tree 形成安全事件记忆。
 - 联动采用 `ctx.get()` 读取可选服务，未加载审计链 / 记忆树时静默降级，不影响权限闸门独立使用。
 
+## v0.3.0 — 声明式通配符规则引擎
+
+- 新增 `rules` 配置：有序的 `allow / ask / deny` 规则，支持工具名 glob（`tools: ["mcp__*", "shell_*"]`）、参数 glob（`params: { command: "rm -rf*" }`）、路径 glob（`paths: ["/workspace/tmp/*"]`），**first-match-wins**，先于 L1-L4 分级执行。
+- 生态对齐：遵循 dsh 生态（dsh-permission-rules / dsh-permissions / dsh-gov）惯例——拒绝规则写在前面、放行规则写在最后。
+- `eco_policy_reload` 返回体新增 `rules` 字段（当前生效规则数），热更新无需重启。
+
 ## 安装
 
 ```bash

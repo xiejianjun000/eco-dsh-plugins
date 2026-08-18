@@ -47,16 +47,28 @@ await ctx.plugin(gatePlugin, {
   mode: 'deny',            // L3 非白名单直接拒绝
   l4Mode: 'ask',           // L4 需要审批
   nonInteractive: true,    // ask 无审批通道 -> 拒绝
+  recordDeniedToMemory: true, // P1 联动：deny 写入记忆树
+  // P2 (v0.3.0) declarative wildcard rules — first match wins.
+  rules: [
+    { match: { tools: ['mcp__*'] }, action: 'deny', reason: 'v3-rules: deny all mcp tools' },
+    { match: { tools: ['shell_exec'], params: { command: 'rm*' } }, action: 'deny', reason: 'v3-rules: forbid rm commands' },
+    { match: { tools: ['shell_exec'], params: { command: 'ls*' } }, action: 'allow', reason: 'v3-rules: allow ls commands' },
+  ],
   riskOverrides: {
     my_query_tool: 'L1',
     // eco 插件自带工具按风险分级放行（系统信任内部工具，读取 L1 / 写入 L2）
     eco_audit_verify: 'L1',
     eco_audit_stats: 'L1',
     eco_audit_query: 'L1',
+    eco_audit_summary: 'L1',
+    eco_audit_export: 'L1',
+    eco_policy_reload: 'L1',
     eco_memory_search: 'L1',
+    eco_memory_vector_search: 'L1',
     eco_memory_add: 'L2',
     eco_memory_update: 'L2',
     eco_memory_delete: 'L2',
+    eco_memory_prune: 'L2',
     eco_memory_stats: 'L1',
     eco_memory_sync: 'L2',
   },
@@ -86,6 +98,11 @@ const toolDefs = {
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }] },
     async execute() { return { paid: true } },
   }),
+  mcp__filesystem_read: defineTool({
+    name: 'mcp__filesystem_read', description: 'mcp filesystem read', parameters: { path: { type: 'string' } },
+    output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }] },
+    async execute(a) { return { read: a?.path ?? '' } },
+  }),
 }
 for (const def of Object.values(toolDefs)) ctx.tools.register(def)
 
@@ -97,9 +114,9 @@ const call = (name, args = {}) => ctx.tools.execute({
 })
 
 // --- 1. 插件装配：工具注册 ---
-const ecoTools = ['eco_audit_verify', 'eco_audit_stats', 'eco_audit_query',
-  'eco_memory_add', 'eco_memory_search', 'eco_memory_update',
-  'eco_memory_delete', 'eco_memory_stats', 'eco_memory_sync']
+const ecoTools = ['eco_audit_verify', 'eco_audit_stats', 'eco_audit_query', 'eco_audit_summary', 'eco_audit_export',
+  'eco_memory_add', 'eco_memory_search', 'eco_memory_vector_search', 'eco_memory_update',
+  'eco_memory_delete', 'eco_memory_stats', 'eco_memory_sync', 'eco_memory_prune', 'eco_policy_reload']
 const registered = new Set(ctx.tools.schemas().map((s) => s.name))
 check('插件装配: 9 个 eco 工具全部注册', ecoTools.every((t) => registered.has(t)),
   `missing=${ecoTools.filter((t) => !registered.has(t)).join(',') || 'none'}`)
@@ -117,6 +134,20 @@ check('权限闸门: L3 非白名单拒绝', rL3Deny.isError === true && /denied
 
 const rL4 = await call('apply_payment', { amount: 100 })
 check('权限闸门: L4 外部写拒绝(无审批通道)', rL4.isError === true)
+
+// --- 2.5 P2: 通配符规则引擎（first-match-wins） ---
+const rMcpDeny = await call('mcp__filesystem_read', { path: '/etc/passwd' })
+check('P2 规则: 工具 glob mcp__* deny 拦截', rMcpDeny.isError === true &&
+  /v3-rules|denied by rule/.test(rMcpDeny.error?.message ?? rMcpDeny.error?.reason ?? ''),
+  `reason=${rMcpDeny.error?.reason ?? rMcpDeny.error?.message}`)
+
+const rLsAllow = await call('shell_exec', { command: 'ls -la /tmp' })
+check('P2 规则: 参数 glob ls* allow 放行(绕过 L3)', rLsAllow.isError === false && rLsAllow.value?.ran === 'ls -la /tmp')
+
+const rRmDeny = await call('shell_exec', { command: 'rm -rf /tmp/x' })
+check('P2 规则: 参数 glob rm* deny 拦截(先于 L3)', rRmDeny.isError === true &&
+  /v3-rules|denied by rule/.test(rRmDeny.error?.message ?? rRmDeny.error?.reason ?? ''),
+  `reason=${rRmDeny.error?.reason ?? rRmDeny.error?.message}`)
 
 // --- 3. 审计链：自动记录 + 防篡改 ---
 const rVerify1 = await call('eco_audit_verify')
@@ -172,6 +203,96 @@ check('记忆树: vault 目录生成 md 文件', existsSync(vault) && readdirCou
 
 const rDelete = await call('eco_memory_delete', { id: node1?.id })
 check('记忆树: 删除节点', rDelete.isError === false && rDelete.value?.ok === true)
+
+// --- 4.5 P2: 记忆树遗忘机制 eco_memory_prune ---
+const rAddLow = await call('eco_memory_add', { content: '临时低价值记忆 待遗忘', score: 0, tags: ['trash'] })
+const nodeLow = rAddLow.value?.node
+const rAddSec = await call('eco_memory_add', { content: '安全保护测试记忆', score: 0, tags: ['security'] })
+const nodeSec = rAddSec.value?.node
+
+const rPruneDry = await call('eco_memory_prune', { min_score: 5, dry_run: true })
+check('P2 遗忘: dryRun 预览识别低分候选且不删除', rPruneDry.isError === false && rPruneDry.value?.dry_run === true &&
+  (rPruneDry.value?.candidates ?? 0) >= 1 && (rPruneDry.value?.removed ?? 0) === 0,
+  `candidates=${rPruneDry.value?.candidates}`)
+
+const rSearchLowBefore = await call('eco_memory_search', { query: '临时低价值', limit: 5 })
+check('P2 遗忘: dryRun 后低分节点仍存在', rSearchLowBefore.isError === false && (rSearchLowBefore.value ?? []).some((h) => h?.node?.id === nodeLow?.id))
+
+const rPruneRun = await call('eco_memory_prune', { min_score: 5 })
+check('P2 遗忘: 实际执行删除低分节点并保护 security 标签',
+  rPruneRun.isError === false && rPruneRun.value?.ok === true && (rPruneRun.value?.removed ?? 0) >= 1 &&
+  (rPruneRun.value?.protected ?? 0) >= 1,
+  `removed=${rPruneRun.value?.removed}, protected=${rPruneRun.value?.protected}`)
+
+const rSearchLowAfter = await call('eco_memory_search', { query: '临时低价值', limit: 5 })
+check('P2 遗忘: 低分节点已删除', rSearchLowAfter.isError === false && !(rSearchLowAfter.value ?? []).some((h) => h?.node?.id === nodeLow?.id))
+
+const rSearchSecAfter = await call('eco_memory_search', { query: '安全保护测试', limit: 5 })
+check('P2 遗忘: security 标签节点受保护保留', rSearchSecAfter.isError === false && (rSearchSecAfter.value ?? []).some((h) => h?.node?.id === nodeSec?.id))
+
+// --- 5. P1: 审计链查询增强（过滤 + 分页 + 汇总） ---
+const rQDeny = await call('eco_audit_query', { decision: 'deny', limit: 10 })
+check('P1 审计: 按 decision=deny 过滤', rQDeny.isError === false && (rQDeny.value ?? []).length >= 2 &&
+  (rQDeny.value ?? []).every((e) => e.decision === 'deny'), `denied=${(rQDeny.value ?? []).length}`)
+
+const rQLevel = await call('eco_audit_query', { level: 'L4', limit: 10 })
+check('P1 审计: 按 level=L4 过滤', rQLevel.isError === false && (rQLevel.value ?? []).length >= 1 &&
+  (rQLevel.value ?? []).every((e) => e.level === 'L4'))
+
+const rQKw = await call('eco_audit_query', { keyword: 'denied', limit: 10 })
+check('P1 审计: 按 keyword=denied 过滤', rQKw.isError === false && (rQKw.value ?? []).length >= 2)
+
+const rQOffset = await call('eco_audit_query', { limit: 1, offset: 1 })
+check('P1 审计: offset 分页生效', rQOffset.isError === false && (rQOffset.value ?? []).length === 1)
+
+const rSum = await call('eco_audit_summary')
+check('P1 审计: summary 分布统计(denied_total>=2, by_decision.deny>=2)',
+  rSum.isError === false && (rSum.value?.denied_total ?? 0) >= 2 && ((rSum.value?.by_decision ?? {}).deny ?? 0) >= 2,
+  `denied_total=${rSum.value?.denied_total}`)
+
+// --- 6. P1: 权限策略热更新 ---
+const rReload = await call('eco_policy_reload')
+check('P1 策略: eco_policy_reload 生效并返回 overrides',
+  rReload.isError === false && rReload.value?.ok === true && !!rReload.value?.overrides &&
+  rReload.value.overrides.eco_audit_summary === 'L1')
+
+// --- 7. P1: 三插件联动 — deny 事件写入记忆树 ---
+const rSecSearch = await call('eco_memory_search', { query: 'SECURITY denied', limit: 5 })
+check('P1 联动: deny 事件已写入记忆树(security 标签可检索)',
+  rSecSearch.isError === false && (rSecSearch.value ?? []).length >= 1 &&
+  (rSecSearch.value ?? [])[0]?.node?.tags?.includes('security'),
+  `hits=${(rSecSearch.value ?? []).length}`)
+
+// --- 8. P1: 记忆树向量通道降级 ---
+const rVec = await call('eco_memory_vector_search', { query: 'sm3 hash chain', limit: 5 })
+check('P1 向量: 无 embedding 配置时优雅降级(vector_enabled=false)',
+  rVec.isError === false && rVec.value?.vector_enabled === false && Array.isArray(rVec.value?.results))
+
+// --- 9. P2: 审计链导出 eco_audit_export（无归档时返回全量 live） ---
+const rExport = await call('eco_audit_export', { decision: 'deny', limit: 100 })
+check('P2 审计: eco_audit_export 跨链导出(deny 过滤)', rExport.isError === false && Array.isArray(rExport.value) &&
+  (rExport.value ?? []).length >= 2 && (rExport.value ?? []).every((e) => e.decision === 'deny'),
+  `exported=${(rExport.value ?? []).length}`)
+
+// --- 10. P2: 审计链 maxEntries 归档轮转（独立 context，不污染主链） ---
+const rotDir = join(base, 'audit-rot')
+const ctxRot = new Context()
+await ctxRot.plugin(SystemPrompt, { persona: 'test' })
+await ctxRot.plugin(ToolRegistry, { mode: 'native' })
+await ctxRot.plugin(auditPlugin, { auditDir: rotDir, maxEntries: 3 })
+for (let i = 0; i < 8; i++) {
+  ctxRot.ecoAudit.append({ when: Date.now() / 1000, who: 'rot-test', what: `entry-${i}`, result: 'ok', cost: '0ms' }, 'tool_call', 'rot-test')
+}
+const archivesRot = ctxRot.ecoAudit.archives()
+check('P2 轮转: 超过 maxEntries=3 后生成归档文件', archivesRot.length >= 1, `archives=${archivesRot.length}`)
+const rotVerify = ctxRot.ecoAudit.verify()
+check('P2 轮转: 归档后 live 链完整可验证(从 genesis 重新开始)',
+  rotVerify.ok === true && rotVerify.entries >= 1 && rotVerify.entries < 3,
+  `live_entries=${rotVerify.entries}`)
+const rotExport = ctxRot.ecoAudit.exportAll()
+check('P2 轮转: exportAll 合并 live+归档记录(8 条不丢)',
+  rotExport.length === 8, `exported=${rotExport.length}`)
+await ctxRot.stop?.()
 
 await ctx.stop?.()
 

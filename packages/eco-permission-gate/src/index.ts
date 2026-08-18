@@ -20,7 +20,16 @@
  *     eco-memory-tree plugin is loaded, denied attempts are also written into
  *     the memory tree as tagged security events.
  *
- * Tool risk resolution: PERMISSION.md / config overrides > prefix map > L3 default.
+ * P2 (v0.3.0) additions — declarative wildcard rule engine:
+ *   - `rules` config: ordered allow/ask/deny rules matching tool-name globs
+ *     (`mcp__*`, `shell_*`), parameter value globs (e.g. `rm -rf*`), and
+ *     workspace path globs. Evaluation is first-match-wins, mirroring the
+ *     ecosystem standard (dsh-permission-rules / dsh-permissions / dsh-gov):
+ *     write the denials first and the permissive rules last.
+ *   - Rules run BEFORE the L1-L4 risk ladder, so a rule can both harden a
+ *     read-only tool (deny) and unlock an otherwise-ask L4 tool (allow).
+ *
+ * Tool risk resolution: rules > PERMISSION.md / config overrides > prefix map > L3 default.
  * mcp__{server}__{tool} remote tools always resolve to L3 (server is untrusted;
  * a write operation can masquerade as a query_* name) unless explicitly
  * overridden — same conservative rule as the original.
@@ -95,7 +104,28 @@ export const Config = Schema.object({
     .description('Optional PERMISSION.md path; its tool_risk_overrides block is loaded'),
   recordDeniedToMemory: Schema.boolean().default(false)
     .description('P1 linkage: write denied attempts into the memory tree (needs eco-memory-tree)'),
+  rules: Schema.array(Schema.object({
+    match: Schema.object({
+      tools: Schema.array(String).default([])
+        .description('Tool-name globs, e.g. ["mcp__*", "shell_*", "query_*"]'),
+      params: Schema.dict(String).default({})
+        .description('Param key -> value glob, e.g. { "command": "rm -rf*" }'),
+      paths: Schema.array(String).default([])
+        .description('Workspace path globs matched against stringified arguments'),
+    }).default({ tools: [], params: {}, paths: [] }),
+    action: Schema.union(['allow', 'ask', 'deny']).required()
+      .description('Decision when the rule matches'),
+    reason: Schema.string().default('')
+      .description('Optional reason surfaced in ask/deny and audit'),
+  }).description('Ordered first-match-wins rules: denials first, permissive rules last')).default([])
+    .description('P2 declarative wildcard rules (tool glob / param glob / path glob)'),
 }).description('eco-permission-gate configuration')
+
+interface PolicyRule {
+  match: { tools: string[]; params: Record<string, string>; paths: string[] }
+  action: 'allow' | 'ask' | 'deny'
+  reason: string
+}
 
 interface PolicyState {
   overrides: Record<string, string>
@@ -106,6 +136,7 @@ interface PolicyState {
   whitelist: string[]
   policyFile: string
   recordDeniedToMemory: boolean
+  rules: PolicyRule[]
   loadedFrom: string
 }
 
@@ -119,24 +150,37 @@ export function apply(ctx: Context, config: ConfigType) {
     whitelist: [...config.l3Whitelist],
     policyFile: config.policyFile,
     recordDeniedToMemory: config.recordDeniedToMemory,
+    rules: normalizeRules(config.rules ?? []),
     loadedFrom: '',
   }
   state.overrides = resolveOverrides(state)
 
   /** Reload policy at runtime: re-parse PERMISSION.md + re-merge config overrides. */
-  function reload(): { ok: boolean; overrides: Record<string, string>; loaded_from?: string } {
+  function reload(): { ok: boolean; overrides: Record<string, string>; rules: number; loaded_from?: string } {
     state.overrides = resolveOverrides(state)
     state.mode = config.mode
     state.l4Mode = config.l4Mode
     state.nonInteractive = config.nonInteractive
     state.whitelist = [...config.l3Whitelist]
-    return { ok: true, overrides: { ...state.overrides }, loaded_from: state.loadedFrom || undefined }
+    state.rules = normalizeRules(config.rules ?? [])
+    return { ok: true, overrides: { ...state.overrides }, rules: state.rules.length, loaded_from: state.loadedFrom || undefined }
   }
 
   ctx.provide('ecoPolicy', { reload })
 
   ctx.on('tools/pre-execute', async (exec: ToolExecution, next): Promise<PreToolDecision> => {
     const toolName = exec.name ?? 'unknown'
+    // P2: declarative wildcard rules run first (first match wins).
+    const ruleHit = matchRule(toolName, exec, state.rules)
+    if (ruleHit) {
+      if (ruleHit.action === 'allow') return next()
+      if (ruleHit.action === 'ask' && !state.nonInteractive) {
+        return { kind: 'ask', reason: `[eco-permission-gate rule] ${toolName} requires approval: ${ruleHit.reason || ruleHit.action}` }
+      }
+      deny(ctx, toolName, 'RULE', `denied by rule: ${ruleHit.reason || '(no reason)'}`, state)
+      return { kind: 'deny', reason: `[eco-permission-gate rule] ${toolName} denied: ${ruleHit.reason || '(no reason)'}` }
+    }
+
     const level = toolRiskLevel(toolName, state.overrides)
 
     if (level === 'L1' || level === 'L2') {
@@ -188,6 +232,65 @@ export function toolRiskLevel(toolName: string, overrides: Record<string, string
     if (prefixes.some((p) => toolName.startsWith(p))) return level
   }
   return DEFAULT_UNKNOWN_LEVEL
+}
+
+/** Minimal glob matcher: '*' matches any sequence (including empty). No deps. */
+export function globMatch(pattern: string, value: string): boolean {
+  if (!pattern) return false
+  if (pattern === '*') return true
+  if (!pattern.includes('*')) return pattern === value
+  const parts = pattern.split('*')
+  let rest = value
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i]
+    if (part === '') continue
+    if (i === 0) {
+      if (!rest.startsWith(part)) return false
+      rest = rest.slice(part.length)
+    } else if (i === parts.length - 1) {
+      return rest.endsWith(part)
+    } else {
+      const idx = rest.indexOf(part)
+      if (idx === -1) return false
+      rest = rest.slice(idx + part.length)
+    }
+  }
+  return true
+}
+
+function normalizeRules(rules: PolicyRule[]): PolicyRule[] {
+  return rules.map((r) => ({
+    match: {
+      tools: r.match?.tools ?? [],
+      params: r.match?.params ?? {},
+      paths: r.match?.paths ?? [],
+    },
+    action: r.action,
+    reason: r.reason ?? '',
+  }))
+}
+
+/** First-match-wins rule evaluation over tool glob / param glob / path glob. */
+function matchRule(toolName: string, exec: ToolExecution, rules: PolicyRule[]): PolicyRule | null {
+  if (!rules || rules.length === 0) return null
+  const args = (exec.arguments ?? {}) as Record<string, unknown>
+  const argsText = JSON.stringify(args ?? {})
+  for (const rule of rules) {
+    const m = rule.match
+    const toolHit = m.tools.length === 0 || m.tools.some((g) => globMatch(g, toolName))
+    if (!toolHit) continue
+    let paramHit = true
+    for (const [key, pattern] of Object.entries(m.params)) {
+      const val = args?.[key]
+      const s = typeof val === 'string' ? val : JSON.stringify(val ?? '')
+      if (!globMatch(pattern, s)) { paramHit = false; break }
+    }
+    if (!paramHit) continue
+    const pathHit = m.paths.length === 0 || m.paths.some((g) => globMatch(g, argsText))
+    if (!pathHit) continue
+    return rule
+  }
+  return null
 }
 
 function extractCommand(exec: ToolExecution): string {
@@ -263,4 +366,5 @@ type ConfigType = {
   l3Whitelist: string[]
   policyFile: string
   recordDeniedToMemory: boolean
+  rules?: PolicyRule[]
 }
