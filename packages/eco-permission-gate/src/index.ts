@@ -33,7 +33,8 @@ declare module '@deepseek-ai/cordis' {
 }
 
 export const name = 'eco-permission-gate'
-export const inject = ['tools']
+// ecoAudit 为可选依赖：审计链插件加载后才可写拒绝事件；未加载时静默跳过
+export const inject = ['tools', 'ecoAudit']
 
 export const LEVEL_LABELS = { L1: 'READ', L2: 'WRITE_LOCAL', L3: 'EXEC', L4: 'EXTERNAL' } as const
 export type RiskLevel = keyof typeof LEVEL_LABELS

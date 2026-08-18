@@ -214,7 +214,7 @@ declare module '@deepseek-ai/cordis' {
 
 export function apply(ctx: Context, config: ConfigType) {
   const service = new EcoAuditService(config.auditDir)
-  ctx.ecoAudit = service
+  ctx.provide('ecoAudit', service)
 
   if (config.autoRecord) {
     // Observe the immutable final outcome of every tool call.

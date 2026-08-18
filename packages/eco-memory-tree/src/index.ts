@@ -288,7 +288,7 @@ declare module '@deepseek-ai/cordis' {
 
 export function apply(ctx: Context, config: ConfigType) {
   const service = new MemoryTreeService(config.storeFile, config.obsidianVault)
-  ctx.ecoMemory = service
+  ctx.provide('ecoMemory', service)
   if (config.syncOnStart && config.obsidianVault) service.sync('from')
 
   ctx.tools.register(defineTool({
